@@ -49,6 +49,7 @@ from .integrations import (  # isort: split
     run_hp_search_ray,
     run_hp_search_sigopt,
     run_hp_search_wandb,
+    run_hp_search_syne_tune,
 )
 
 import numpy as np
@@ -1175,6 +1176,8 @@ class Trainer:
             params = {k: int(v) if isinstance(v, str) else v for k, v in trial.assignments.items()}
         elif self.hp_search_backend == HPSearchBackend.WANDB:
             params = trial
+        elif self.hp_search_backend == HPSearchBackend.SYNETUNE:
+            params = trial
 
         for key, value in params.items():
             if not hasattr(self.args, key):
@@ -1904,6 +1907,9 @@ class Trainer:
                 import wandb
 
                 run_id = wandb.run.id
+            elif self.hp_search_backend == HPSearchBackend.SYNETUNE:
+                run_id = trial['trial_id']
+
             run_name = self.hp_name(trial) if self.hp_name is not None else f"run-{run_id}"
             run_dir = os.path.join(self.args.output_dir, run_name)
         else:
@@ -2379,6 +2385,7 @@ class Trainer:
             HPSearchBackend.RAY: run_hp_search_ray,
             HPSearchBackend.SIGOPT: run_hp_search_sigopt,
             HPSearchBackend.WANDB: run_hp_search_wandb,
+            HPSearchBackend.SYNETUNE: run_hp_search_syne_tune,
         }
         best_run = backend_dict[backend](self, n_trials, direction, **kwargs)
 

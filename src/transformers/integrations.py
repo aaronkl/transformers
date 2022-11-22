@@ -87,6 +87,10 @@ def is_optuna_available():
     return importlib.util.find_spec("optuna") is not None
 
 
+def is_syne_tune_available():
+    return importlib.util.find_spec("syne_tune") is not None
+
+
 def is_ray_available():
     return importlib.util.find_spec("ray") is not None
 
@@ -142,6 +146,10 @@ def hp_params(trial):
             return trial
 
     if is_wandb_available():
+        if isinstance(trial, dict):
+            return trial
+
+    if is_syne_tune_available():
         if isinstance(trial, dict):
             return trial
 
@@ -510,6 +518,184 @@ def run_hp_search_wandb(trainer, n_trials: int, direction: str, **kwargs) -> Bes
     wandb.agent(sweep_id, function=_objective, count=n_trials)
 
     return BestRun(best_trial["run_id"], best_trial["objective"], best_trial["hyperparameters"])
+
+
+def run_hp_search_syne_tune(trainer, n_trials: int, direction: str, **kwargs) -> BestRun:
+
+    import pathlib
+    import dill
+    from syne_tune.backend.local_backend import LocalBackend
+    from syne_tune.tuner import Tuner
+    from syne_tune.backend.sagemaker_backend.sagemaker_utils import get_execution_role
+    from syne_tune.backend import SageMakerBackend
+    from syne_tune.stopping_criterion import StoppingCriterion
+    from syne_tune.optimizer.baselines import BayesianOptimization, RandomSearch, ASHA, PopulationBasedTraining, \
+        MOBSTER, MOASHA
+    from syne_tune.optimizer.schedulers.fifo import FIFOScheduler
+    from syne_tune.optimizer.schedulers.median_stopping_rule import MedianStoppingRule
+    from syne_tune.config_space import to_dict, Domain
+    from syne_tune.report import Reporter
+    from syne_tune.constants import ST_WORKER_COST
+    from syne_tune.backend.python_backend.python_backend import file_md5
+    from transformers import trainer_callback
+    class ReportBackMetrics(trainer_callback.TrainerCallback):
+        def __init__(self, trainer):
+            from syne_tune import Reporter
+            self.report = Reporter()
+            self.trainer = trainer
+
+        def on_evaluate(self, args, state, control, **kwargs):
+            results = kwargs['metrics'].copy()
+            results['step'] = state.global_step
+            results['epoch'] = int(state.epoch)
+            results['loading_time'] = self.trainer.loading_time
+
+            self.report(objective=self.trainer.compute_objective(results), **results)
+
+    tune_function_path = pathlib.Path(kwargs.pop("tune_function_path", str(pathlib.Path(__file__).parent / 'st_utils')))
+    num_workers = kwargs.pop("num_workers", 1)
+    # if num_workers > 1:
+    #     num_workers -= 1
+    timeout = kwargs.pop("timeout", None)
+    random_seed = kwargs.pop("random_seed", None)
+    scheduler_name = kwargs.pop("scheduler", 'bayesian_optimization')
+    execution_mode = kwargs.pop("execution_mode", 'local')
+
+    config_space = trainer.hp_space(None)
+    #     evaluate_only_at_the_end = scheduler in ['random_search', 'bayesian_optimization', 'tpe']
+    #     if not evaluate_only_at_the_end:
+    trainer.add_callback(ReportBackMetrics(trainer))
+    #     else:
+    #         config_space['evaluate_only_at_the_end'] = True
+
+    trainer.args._n_gpu = 1
+
+    if 'num_train_epochs' in config_space and isinstance(config_space['num_train_epochs'], Domain) and scheduler_name in [
+        'mobster', 'asha']:
+        logger.warning(
+            f'The hyperparameter "num_train_epochs" should not be optimized with {scheduler_name} since the attribute is used to automatically allocated resources')
+
+    # config_space['tune_function_root'] = str(pathlib.Path(__file__).parent)
+
+    if scheduler_name in ['mobster', 'asha']:
+        config_space['epochs'] = trainer.args.num_train_epochs
+
+    tune_function_path.mkdir(parents=True, exist_ok=True)
+    with open(tune_function_path / "trainer.dill", "wb") as file:
+        dill.dump(trainer, file)
+
+    config_space["tune_function_hash"] = file_md5(
+            str(tune_function_path / "trainer.dill")
+        )
+
+    with open(tune_function_path / "configspace.json", "w") as file:
+        json.dump({k: to_dict(v) if isinstance(v, Domain) else v for k, v in config_space.items()}, file)
+
+    if execution_mode == 'local':
+        backend = LocalBackend(entry_point=str(pathlib.Path(__file__).parent / 'st_utils' / "hf_entry_point.py"))
+
+    elif execution_mode == 'sagemaker':
+        from sagemaker.huggingface import HuggingFace
+        backend = SageMakerBackend(
+            sm_estimator=HuggingFace(
+                entry_point="./st_utils/hf_entry_point.py",
+                source_dir=os.getcwd(),
+                base_job_name='hf-trainer',
+                # instance-type given here are override by Syne Tune with values sampled from `st_instance_type`.\n",
+                instance_type='ml.g4dn.xlarge',
+                instance_count=1,
+                py_version="py38",
+                pytorch_version='1.9',
+                transformers_version='4.12',
+                max_run=3600,
+                role=get_execution_role(),
+            )
+        )
+
+    mode = 'min' if direction == 'minimize' else 'max'
+    resource_attr = trainer.args.evaluation_strategy.value
+
+    if scheduler_name == 'random_search':
+        scheduler = RandomSearch(config_space, metric='objective', mode=mode, random_seed=random_seed, **kwargs)
+    elif scheduler_name == 'bayesian_optimization':
+        scheduler = BayesianOptimization(config_space, metric='objective', mode=mode, random_seed=random_seed, **kwargs)
+    elif scheduler_name == 'tpe':
+        scheduler = FIFOScheduler(
+            config_space=config_space,
+            searcher="kde",
+            search_options={'debug_log': False, 'min_bandwidth': 0.1},
+            metric='objective',
+            mode=mode,
+            random_seed=random_seed)
+
+    elif scheduler_name == 'median_stopping_rule':
+
+        scheduler = MedianStoppingRule(
+            scheduler=FIFOScheduler(
+                config_space=config_space,
+                searcher="random",
+                metric='objective',
+                mode=mode,
+                random_seed=random_seed,
+            ),
+            resource_attr=resource_attr,
+            running_average=False,
+        )
+    elif scheduler_name == 'asha':
+        scheduler = ASHA(config_space, metric='objective', mode=mode, resource_attr=resource_attr,
+                         random_seed=random_seed, max_t=int(trainer.args.num_train_epochs), **kwargs)
+    elif scheduler_name == 'pbt':
+        scheduler = PopulationBasedTraining(config_space, metric='objective', mode=mode, resource_attr=resource_attr,
+                                            random_seed=random_seed, max_t=int(trainer.args.num_train_epochs), **kwargs)
+    elif scheduler_name == 'mobster':
+        scheduler = MOBSTER(config_space, metric='objective', mode=mode, resource_attr=resource_attr,
+                            random_seed=random_seed, max_t=int(trainer.args.num_train_epochs), **kwargs)
+
+    elif scheduler_name == 'moasha':
+       scheduler = MOASHA(
+            max_t=int(trainer.args.num_train_epochs),
+            time_attr=resource_attr,
+            metrics=['objective', ST_WORKER_COST],
+            mode=[mode, 'min'],
+            config_space=config_space,
+        )
+
+    else:
+        Exception(f'Scheduler {scheduler_name} is not a valid scheduler. Needs to be in [random_search,'
+                  f'bayesian_optimization, tpe, median_stopping_rule, pbt, asha, mobster, moasha].')
+
+    if timeout is not None:
+        stop_criterion = StoppingCriterion(max_wallclock_time=timeout)
+    else:
+        stop_criterion = StoppingCriterion(max_num_trials_finished=n_trials)
+
+    tuner = Tuner(
+        trial_backend=backend,
+        scheduler=scheduler,
+        stop_criterion=stop_criterion,
+        n_workers=num_workers,
+        # results_update_interval=120,
+        # sleep_time=0,
+    )
+    tuner.run()
+
+    from syne_tune.experiments import load_experiment
+
+    tuning_experiment = load_experiment(tuner.name)
+    best = tuning_experiment.best_config()
+
+    hyperparameters = {}
+    for k, v in best.items():
+        if k.startswith('config_'):
+            hyperparameters[k] = v
+
+    best_run = BestRun(best['trial_id'], best['objective'], hyperparameters)
+
+    trainer.syne_tune_info = {'loading_time': list(tuning_experiment.results['loading_time']),
+                'worker_time': list(tuning_experiment.results['st_worker_time']),
+                'runtime': list(tuning_experiment.results['st_tuner_time'])}
+
+    return best_run
 
 
 def get_available_reporting_integrations():

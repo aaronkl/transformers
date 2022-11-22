@@ -287,11 +287,26 @@ def default_hp_space_wandb(trial) -> Dict[str, float]:
     }
 
 
+def default_hp_space_syne_tune(trial) -> Dict[str, float]:
+    from .integrations import is_syne_tune_available
+    if not is_syne_tune_available():
+        raise ImportError("This function needs Syne Tune installed: `pip install 'syne-tune'`")
+
+    from syne_tune.config_space import loguniform, randint, uniform
+
+    return {
+        "learning_rate": loguniform(1e-7, 1e-3),
+        "per_device_train_batch_size": randint(4, 64),
+        'warmup_ratio': uniform(0, 0.5),
+    }
+
+
 class HPSearchBackend(ExplicitEnum):
     OPTUNA = "optuna"
     RAY = "ray"
     SIGOPT = "sigopt"
     WANDB = "wandb"
+    SYNETUNE = "syne_tune"
 
 
 default_hp_space = {
@@ -299,6 +314,7 @@ default_hp_space = {
     HPSearchBackend.RAY: default_hp_space_ray,
     HPSearchBackend.SIGOPT: default_hp_space_sigopt,
     HPSearchBackend.WANDB: default_hp_space_wandb,
+    HPSearchBackend.SYNETUNE: default_hp_space_syne_tune,
 }
 
 
